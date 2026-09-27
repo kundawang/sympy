@@ -1,4 +1,7 @@
 from __future__ import annotations
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from bisect import bisect, bisect_left
 
 from sympy.functions.combinatorial.numbers import mobius, totient
@@ -282,3 +285,48 @@ def test_deprecated_ntheory_symbolic_functions():
 
     with warns_deprecated_sympy():
         assert primepi(0) == 0
+
+
+def test_sieve_thread_safety():
+    # The Sieve arrays use copy-on-write so that concurrent access from
+    # multiple threads always sees fully initialised arrays. Previously
+    # the arrays were extended in place and could be corrupted (e.g.
+    # duplicated primes or wrong totient values) when extended from
+    # multiple threads.
+
+    # A small sieve_interval makes the arrays be extended in many small
+    # steps which increases the chance of overlapping extensions.
+    shared = Sieve(sieve_interval=1000)
+
+    # Reference values computed single-threaded from a separate Sieve.
+    ref = Sieve()
+    expected_primes = [ref[i] for i in range(1, 1000)]
+    expected_primerange = list(ref.primerange(2, 2000))
+    expected_totients = list(ref.totientrange(1, 500))
+    expected_mobius = list(ref.mobiusrange(1, 500))
+    expected_search = [ref.search(n) for n in range(2, 300)]
+
+    nthreads = 4
+    barrier = threading.Barrier(nthreads)
+
+    def worker():
+        barrier.wait(timeout=10)
+        for _ in range(3):
+            assert [shared[i] for i in range(1, 1000)] == expected_primes
+            assert list(shared.primerange(2, 2000)) == expected_primerange
+            assert list(shared.totientrange(1, 500)) == expected_totients
+            assert list(shared.mobiusrange(1, 500)) == expected_mobius
+            assert [shared.search(n) for n in range(2, 300)] == expected_search
+            assert 997 in shared
+            assert 999 not in shared
+
+    # A small switch interval widens the window for races between threads.
+    old_switchinterval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        with ThreadPoolExecutor(max_workers=nthreads) as executor:
+            futures = [executor.submit(worker) for _ in range(nthreads)]
+            for future in futures:
+                future.result()
+    finally:
+        sys.setswitchinterval(old_switchinterval)
